@@ -1,0 +1,89 @@
+def get_lr(global_step,
+           total_epochs,
+           steps_per_epoch,
+           lr_init=0.01,
+           lr_max=0.1,
+           warmup_epochs=5):
+    """
+    Generate learning rate array.
+
+    Args:
+        global_step (int): Initial step of training.
+        total_epochs (int): Total epoch of training.
+        steps_per_epoch (float): Steps of one epoch.
+        lr_init (float): Initial learning rate. Default: 0.01.
+        lr_max (float): Maximum learning rate. Default: 0.1.
+        warmup_epochs (int): The number of warming up epochs. Default: 5.
+
+    Returns:
+        np.array, learning rate array.
+    """
+    lr_each_step = []
+    total_steps = steps_per_epoch * total_epochs
+    warmup_steps = steps_per_epoch * warmup_epochs
+    if warmup_steps != 0:
+        inc_each_step = (float(lr_max) - float(lr_init)) / float(warmup_steps)
+    else:
+        inc_each_step = 0
+    for i in range(int(total_steps)):
+        if i < warmup_steps:
+            lr = float(lr_init) + inc_each_step * float(i)
+        else:
+            base = ( 1.0 - (float(i) - float(warmup_steps)) / (float(total_steps) - float(warmup_steps)) )
+            lr = float(lr_max) * base * base
+            if lr < 0.0:
+                lr = 0.0
+        lr_each_step.append(lr)
+
+    current_step = global_step
+    lr_each_step = np.array(lr_each_step).astype(np.float32)
+    learning_rate = lr_each_step[current_step:]
+
+    return learning_rate
+
+# 构建ResNet50网络，输出类别数为5，对应5种花的类别
+net=resnet50(class_num=cfg.num_class)
+
+# 设置Softmax交叉熵损失函数
+loss = nn.SoftmaxCrossEntropyWithLogits(sparse=True, reduction="mean")
+
+# 设置动态学习率
+train_step_size = de_train.get_dataset_size()
+lr = Tensor(get_lr(global_step=0, total_epochs=cfg.epoch_size, steps_per_epoch=train_step_size))
+
+# 设置动量优化器
+opt = Momentum(net.trainable_params(), lr, momentum=0.9, weight_decay=1e-4, loss_scale=cfg.loss_scale_num)
+
+# 损失值平滑，解决训练过程中梯度过小的问题
+loss_scale = FixedLossScaleManager(cfg.loss_scale_num, False)
+
+# 模型编译，输入网络结构，损失函数，优化器，损失值平滑，以及模型评估标准
+model = Model(net, loss_fn=loss, optimizer=opt, loss_scale_manager=loss_scale, metrics={'acc'})
+
+# 损失值监控
+loss_cb = LossMonitor(per_print_times=train_step_size)
+
+# 模型保存参数，设置每隔多少步保存一次模型，最多保存几个模型
+ckpt_config = CheckpointConfig(save_checkpoint_steps=cfg.save_checkpoint_steps, keep_checkpoint_max=1)
+
+# 模型保存，设置模型保存的名称，路径，以及保存参数
+ckpoint_cb = ModelCheckpoint(prefix=cfg.prefix, directory=cfg.directory, config=ckpt_config)
+
+print("============== Starting Training ==============")
+# 训练模型，设置训练次数，训练集，回调函数，是否采用数据下沉模式（只可应用于Ascend 和GPU，可加快训练速度）
+model.train(cfg.epoch_size, de_train, callbacks=[loss_cb,ckpoint_cb], dataset_sink_mode=True)
+# 训练时长大约15-20分钟
+
+# 模型预测，从测试集中取10个样本进行测试，输出预测结果和真实标签
+class_names = {0:'daisy',1:'dandelion',2:'roses',3:'sunflowers',4:'tulips'}
+for i in range(10):
+    test_ = de_test.create_dict_iterator().__next__()
+    test = Tensor(test_['image'], mindspore.float32)
+    # 模型预测
+    predictions = model.predict(test)
+    predictions = predictions.asnumpy()
+    true_label = test_['label'].asnumpy()
+    # 显示预测结果
+    p_np = predictions[0, :]
+    pre_label = np.argmax(p_np)
+    print('第' + str(i) + '个sample预测结果：', class_names[pre_label], '   真实结果：', class_names[true_label[0]])
